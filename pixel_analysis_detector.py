@@ -56,7 +56,124 @@ class AcneDetector:
         self.scales = [1.0, 0.5, 0.25]
         self.min_spot_area = 20
         self.max_spot_area = 5000
-    
+        # Gamma normalization settings
+        self.use_gamma = True
+        self.gamma_mode = 'auto'  # 'auto' or 'manual'
+        self.gamma_space = 'LAB'  # 'LAB' or 'HSV'
+        self.gamma_value = None   # used if gamma_mode == 'manual'
+        self.gamma_target_median = 0.5  # target median luminance in [0,1]
+        self.gamma_min = 0.85
+        self.gamma_max = 1.15
+        # Face masking for skin sampling
+        self.use_face_mask = True
+
+    def get_face_mask(self, img_gray):
+        """Rough face mask to limit skin sampling to the main facial region."""
+        h, w = img_gray.shape[:2]
+
+        # Smooth and auto-threshold to isolate bright skin-like areas
+        blur = cv2.GaussianBlur(img_gray, (7, 7), 0)
+        _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            face_mask = np.zeros_like(mask)
+            cv2.drawContours(face_mask, [largest], -1, 255, thickness=cv2.FILLED)
+        else:
+            # Fallback: central ellipse covering most of the frame
+            face_mask = np.zeros_like(mask)
+            center = (w // 2, h // 2)
+            axes = (int(w * 0.45), int(h * 0.55))
+            cv2.ellipse(face_mask, center, axes, 0, 0, 360, 255, thickness=cv2.FILLED)
+
+        face_mask = cv2.morphologyEx(face_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        return face_mask.astype(bool)
+
+    def apply_gamma(self, img_bgr):
+        """Apply CLAHE + gamma normalization on luminance while preserving chroma.
+
+        Args:
+            img_bgr: Input image in BGR
+        Returns:
+            (img_bgr_out, gamma_used)
+        """
+        if not self.use_gamma:
+            return img_bgr, 1.0
+
+        # Step 1: Apply CLAHE to enhance local contrast
+        if self.gamma_space.upper() == 'LAB':
+            img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+            L, A, B = cv2.split(img_lab)
+            
+            # Apply CLAHE to L channel
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            L_clahe = clahe.apply(L)
+            img_lab = cv2.merge([L_clahe, A, B])
+            img_bgr_clahe = cv2.cvtColor(img_lab, cv2.COLOR_LAB2BGR)
+        else:
+            # HSV path with CLAHE on V channel
+            img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            H, S, V = cv2.split(img_hsv)
+            
+            # Apply CLAHE to V channel
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            V_clahe = clahe.apply(V)
+            img_hsv = cv2.merge([H, S, V_clahe])
+            img_bgr_clahe = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
+        
+        # Step 2: Apply gamma normalization on CLAHE result
+        if self.gamma_space.upper() == 'LAB':
+            img_lab = cv2.cvtColor(img_bgr_clahe, cv2.COLOR_BGR2LAB)
+            L, A, B = cv2.split(img_lab)
+            
+            # Compute auto gamma from median luminance
+            if self.gamma_mode == 'auto':
+                med = float(np.median(L)) / 255.0
+                if med <= 0.01:
+                    gamma = 1.0
+                else:
+                    gamma = np.log(max(self.gamma_target_median, 1e-3)) / np.log(max(med, 1e-3))
+                gamma = float(np.clip(gamma, self.gamma_min, self.gamma_max))
+            else:
+                gamma = float(self.gamma_value) if self.gamma_value is not None else 1.0
+
+            if abs(gamma - 1.0) < 1e-3:
+                return img_bgr_clahe, 1.0
+
+            # LUT-based gamma for speed and stability
+            x = np.arange(256, dtype=np.float32) / 255.0
+            lut = np.clip((x ** gamma) * 255.0, 0, 255).astype(np.uint8)
+            L_gamma = cv2.LUT(L, lut)
+            img_lab_gamma = cv2.merge([L_gamma, A, B])
+            img_bgr_out = cv2.cvtColor(img_lab_gamma, cv2.COLOR_LAB2BGR)
+            return img_bgr_out, gamma
+
+        # HSV path with gamma
+        img_hsv = cv2.cvtColor(img_bgr_clahe, cv2.COLOR_BGR2HSV)
+        H, S, V = cv2.split(img_hsv)
+        
+        if self.gamma_mode == 'auto':
+            med = float(np.median(V)) / 255.0
+            if med <= 0.01:
+                gamma = 1.0
+            else:
+                gamma = np.log(max(self.gamma_target_median, 1e-3)) / np.log(max(med, 1e-3))
+            gamma = float(np.clip(gamma, self.gamma_min, self.gamma_max))
+        else:
+            gamma = float(self.gamma_value) if self.gamma_value is not None else 1.0
+
+        if abs(gamma - 1.0) < 1e-3:
+            return img_bgr_clahe, 1.0
+
+        x = np.arange(256, dtype=np.float32) / 255.0
+        lut = np.clip((x ** gamma) * 255.0, 0, 255).astype(np.uint8)
+        V_gamma = cv2.LUT(V, lut)
+        img_hsv_gamma = cv2.merge([H, S, V_gamma])
+        img_bgr_out = cv2.cvtColor(img_hsv_gamma, cv2.COLOR_HSV2BGR)
+        return img_bgr_out, gamma
+        
     def calibrate_from_dataset(self, dataset_path):
         """
         Analyze labeled acne regions to learn color/texture thresholds.
@@ -92,8 +209,13 @@ class AcneDetector:
         
         # Build mappings
         image_map = {img['id']: img['file_name'] for img in coco_data['images']}
+        category_map = {c['id']: c.get('name', '').lower() for c in coco_data.get('categories', [])}
+        darkspot_ids = {cid for cid, name in category_map.items() if name == 'darkspot'}
+        darkspot_filter_enabled = len(darkspot_ids) > 0
         annotations_by_image = {}
         for ann in coco_data['annotations']:
+            if darkspot_filter_enabled and ann.get('category_id') not in darkspot_ids:
+                continue
             img_id = ann['image_id']
             if img_id not in annotations_by_image:
                 annotations_by_image[img_id] = []
@@ -134,6 +256,8 @@ class AcneDetector:
             if img is None:
                 continue
             
+            # Apply gamma normalization before analysis
+            img, _ = self.apply_gamma(img)
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -194,6 +318,9 @@ class AcneDetector:
             
             # Sample non-acne skin regions for comparison
             non_acne_mask = ~acne_mask
+            if self.use_face_mask:
+                face_mask = self.get_face_mask(img_gray)
+                non_acne_mask = non_acne_mask & face_mask
             if non_acne_mask.any():
                 # Sample random pixels from non-acne areas
                 non_acne_hsv = img_hsv[non_acne_mask]
@@ -303,7 +430,7 @@ class AcneDetector:
         print(f"  Avg LAB: ({self.lab_stats['l_mean']:.1f}, {self.lab_stats['a_mean']:.1f}, {self.lab_stats['b_mean']:.1f})")
         
         return True
-    
+        
     def compute_acne_probability(self, img_hsv, img_rgb):
         """
         Compute per-pixel probability of being acne based on learned thresholds.
@@ -391,6 +518,8 @@ class AcneDetector:
         
         print(f"Processing image: {image_path}")
         print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+        # Apply gamma normalization before analysis
+        img, _ = self.apply_gamma(img)
         
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -509,7 +638,16 @@ class AcneDetector:
             's_range': self.s_range,
             'v_range': self.v_range,
             'redness_threshold': float(self.redness_threshold),
-            'color_stats': {k: float(v) for k, v in self.color_stats.items()}
+            'color_stats': {k: float(v) for k, v in self.color_stats.items()},
+            'preprocess': {
+                'use_gamma': bool(self.use_gamma),
+                'gamma_mode': self.gamma_mode,
+                'gamma_space': self.gamma_space,
+                'gamma_value': float(self.gamma_value) if self.gamma_value is not None else None,
+                'gamma_target_median': float(self.gamma_target_median),
+                'gamma_min': float(self.gamma_min),
+                'gamma_max': float(self.gamma_max),
+            }
         }
         
         with open(filepath, 'w') as f:
@@ -527,6 +665,16 @@ class AcneDetector:
             self.v_range = tuple(data['v_range'])
             self.redness_threshold = data['redness_threshold']
             self.color_stats = data['color_stats']
+            # Optional preprocess settings
+            pp = data.get('preprocess')
+            if pp:
+                self.use_gamma = bool(pp.get('use_gamma', self.use_gamma))
+                self.gamma_mode = pp.get('gamma_mode', self.gamma_mode)
+                self.gamma_space = pp.get('gamma_space', self.gamma_space)
+                self.gamma_value = pp.get('gamma_value', self.gamma_value)
+                self.gamma_target_median = float(pp.get('gamma_target_median', self.gamma_target_median))
+                self.gamma_min = float(pp.get('gamma_min', self.gamma_min))
+                self.gamma_max = float(pp.get('gamma_max', self.gamma_max))
             self.calibrated = True
             
             print(f"Calibration loaded from: {filepath}")
@@ -586,8 +734,13 @@ class AcneDetector:
         
         # Build mappings
         image_map = {img['id']: img for img in coco_data['images']}
+        category_map = {c['id']: c.get('name', '').lower() for c in coco_data.get('categories', [])}
+        darkspot_ids = {cid for cid, name in category_map.items() if name == 'darkspot'}
+        darkspot_filter_enabled = len(darkspot_ids) > 0
         annotations_by_image = {}
         for ann in coco_data['annotations']:
+            if darkspot_filter_enabled and ann.get('category_id') not in darkspot_ids:
+                continue
             img_id = ann['image_id']
             if img_id not in annotations_by_image:
                 annotations_by_image[img_id] = []
@@ -632,6 +785,8 @@ class AcneDetector:
             
             print(f"\n[{idx+1}/{num_samples}] Processing: {filename}")
             print(f"  Ground truth: {num_lesions} acne lesion(s)")
+            # Apply gamma normalization
+            img, _ = self.apply_gamma(img)
             
             # Convert BGR to RGB for matplotlib
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -685,7 +840,7 @@ class AcneDetector:
             
             # Detection heatmap
             axes[2].imshow(detection_rgb)
-            axes[2].set_title(f'Detection Heatmap\n(Coverage: {acne_coverage:.1f}%)', fontsize=14, fontweight='bold')
+            axes[2].set_title('Detection Heatmap', fontsize=14, fontweight='bold')
             axes[2].axis('off')
             
             # Create descriptive filename
@@ -715,9 +870,9 @@ def main():
     
     # Directory structure
     input_dir = os.path.join(script_dir, 'input')
-    output_dir = os.path.join(script_dir, 'output', 'simple_heatmap')
-    dataset_inference_dir = os.path.join(script_dir, 'output', 'dataset_inference')
-    calibration_dir = os.path.join(script_dir, 'calibration')
+    output_dir = os.path.join(script_dir, 'output', 'pixel_analysis', 'single')
+    dataset_inference_dir = os.path.join(script_dir, 'output', 'pixel_analysis', 'dataset_inference_v2')
+    calibration_dir = os.path.join(script_dir, 'calibration', 'pixel_analysis')
     dataset_dir = os.path.join(script_dir, 'acne_dataset')
     
     os.makedirs(output_dir, exist_ok=True)

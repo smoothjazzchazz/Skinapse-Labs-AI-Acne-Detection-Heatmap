@@ -1,0 +1,24 @@
+# Generated heatmaps, comparison images, and result dumps
+output/
+
+# Trained model binaries
+*.model
+*.scaler
+
+# Learned calibration dumps
+calibration/**/*.json
+
+# Local input photos
+input/*
+!input/.gitkeep
+
+# Roboflow image export
+acne_dataset/**/*.jpg
+acne_dataset/**/*.jpeg
+acne_dataset/**/*.png
+acne_dataset/**/*.webp
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/

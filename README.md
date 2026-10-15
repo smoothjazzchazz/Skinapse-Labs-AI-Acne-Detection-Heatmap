@@ -1,5 +1,5 @@
 # Testing Suite for Algorithmic, CV, and Image recognition model-based acne detection systems
-Project developed in collaboration with ML@Purdue and Skinapse Labs
+Open source project developed in collaboration with ML@Purdue and Skinapse Labs
 
 Each detector is a separate method. Generated images, trained models, and calibration dumps stay on disk and are not committed.
 
